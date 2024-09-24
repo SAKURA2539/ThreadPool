@@ -1,0 +1,232 @@
+#ifndef THREADPOOL_H
+#define THREADPOOL_H
+
+#include<iostream>
+#include<functional>
+#include<chrono>
+#include<future>
+#include<thread>
+#include<mutex>
+#include<condition_variable>
+#include<memory>
+#include<atomic>
+
+#include<unordered_map>
+#include<vector>
+#include<queue>
+
+const int THREAD_IDLE_TIME = 60;
+
+enum class THREAD_POOL_MODEL{
+    MODEL_FIXED,
+    MODEL_CACHED,
+};
+
+class Thread{
+public:
+    Thread(std::function<void(int)> thread_handler) : thread_handler(thread_handler), thread_id(generate_id++){}
+    ~Thread(){}
+
+    void Start()
+    {
+        std::thread t(thread_handler, thread_id);
+        t.detach();
+    }
+
+    int GetThreadID() const
+    {
+        return thread_id;
+    }
+
+private:
+    std::function<void(int)> thread_handler;
+    static int generate_id;
+    int thread_id;
+};
+int Thread::generate_id = 0;
+
+class ThreadPool{
+private:
+    
+    std::unordered_map<int, std::unique_ptr<Thread>> thread_map;
+    size_t init_thread_number;
+    size_t max_thread_number;
+    std::atomic<size_t> idle_thread_number;
+    std::atomic<size_t> current_thread_number;
+    size_t step_thread_number;
+    
+    std::queue<std::function<void()>> task_queue;
+    std::atomic<size_t> task_number;
+    size_t max_task_number;
+
+    std::mutex task_queue_mutex;
+    std::condition_variable task_queue_no_full, task_queue_no_empty;
+    std::condition_variable thread_pool_exit;
+
+    THREAD_POOL_MODEL thread_pool_model;
+    std::atomic<bool> thread_pool_status;
+
+    bool CheckStatus() const
+    {
+        return thread_pool_status;
+    }
+
+public:
+    ThreadPool() : init_thread_number(std::thread::hardware_concurrency()), max_thread_number(100), idle_thread_number(0), current_thread_number(0), task_number(0), max_task_number(1024), thread_pool_model(THREAD_POOL_MODEL::MODEL_FIXED), thread_pool_status(false){}
+    ~ThreadPool()
+    {
+        thread_pool_status = false;
+        std::unique_lock<std::mutex> lock(task_queue_mutex);
+        this->task_queue_no_empty.notify_all();
+        this->thread_pool_exit.wait(lock, [&]()->bool{return thread_map.size() == 0;});
+    }
+    ThreadPool(const ThreadPool&) = delete;
+    ThreadPool& operator=(const ThreadPool&) = delete;
+
+    void InitThreadPool()
+    {
+        for(size_t i = 0; i < this->init_thread_number; i++)
+        {
+            auto thread_ptr = std::make_unique<Thread>(std::bind(&ThreadPool::ThreadHandler, this, std::placeholders::_1)); 
+            auto thread_id = thread_ptr->GetThreadID();
+            this->thread_map.emplace(thread_id, std::move(thread_ptr));
+
+        }
+        current_thread_number = init_thread_number;
+    }
+    
+    void StartThreadPool()
+    {
+        for(auto& thread : this->thread_map)
+        {
+            thread.second->Start();
+            idle_thread_number++;
+        }
+        thread_pool_status = true;
+    }
+    
+    void SetInitThreadNumber(size_t init_thread_number)
+    {
+        if(CheckStatus()) return;
+        this->init_thread_number = init_thread_number;
+    }
+
+    void SetMaxThreadNumber(size_t max_thread_number)
+    {
+        if(CheckStatus()) return;
+        this->max_thread_number = max_thread_number;
+    }
+
+    void SetMaxTaskNumber(size_t max_task_number)
+    {
+        if(CheckStatus()) return;
+        if(this->thread_pool_model == THREAD_POOL_MODEL::MODEL_CACHED)
+        {
+            this->max_task_number = max_task_number;
+        }
+    }
+
+    void SetModel(THREAD_POOL_MODEL thread_pool_model)
+    {
+        if(CheckStatus()) return;
+        this->thread_pool_model = thread_pool_model;
+    }
+
+    template<typename Fun, typename... Args>
+    auto SubmitTask(Fun&& fun, Args&&... args) -> std::future<decltype(fun(args...))>
+    {
+        using result_type = decltype(fun(args...));
+        auto task = std::make_shared<std::packaged_task<result_type()>>(std::bind(std::forward<Fun>(fun), std::forward<Args>(args)...));
+        std::future<result_type> result = task->get_future();
+
+        std::unique_lock<std::mutex> lock(this->task_queue_mutex);
+
+        if(!this->task_queue_no_full.wait_for(lock, std::chrono::seconds(1), [&]()->bool{return this->task_queue.size() < this->max_task_number;}))
+        {
+            std::cerr << "submit task timeout" << std::endl;
+            auto task = std::make_shared<std::packaged_task<result_type()>>([]()->result_type{return result_type();});
+            (*task)();
+            return task->get_future();
+        }
+
+        this->task_queue.emplace([task](){(*task)();});
+        this->task_number++;
+
+        this->task_queue_no_empty.notify_all();
+
+        if(thread_pool_model == THREAD_POOL_MODEL::MODEL_CACHED && task_number > idle_thread_number && current_thread_number < max_thread_number)
+        {
+            std::cout << "create thread" << std::endl;
+
+            auto thread_ptr = std::make_unique<Thread>(std::bind(&ThreadPool::ThreadHandler, this, std::placeholders::_1)); 
+            auto thread_id = thread_ptr->GetThreadID();
+            this->thread_map.emplace(thread_id, std::move(thread_ptr));
+            
+            thread_map[thread_id]->Start();
+
+            idle_thread_number++;
+            current_thread_number++;
+        }
+        return result;
+    }
+
+private:
+    void ThreadHandler(int thread_id)
+    {   
+        auto last_time = std::chrono::high_resolution_clock().now();
+        for(;;)
+        {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(this->task_queue_mutex);
+
+                //Join thread
+                while(task_number == 0)
+                {
+                    if(!thread_pool_status) 
+                    {
+                        thread_map.erase(thread_id);
+                        this->thread_pool_exit.notify_one();
+                        return;
+                    }
+                    if(thread_pool_model == THREAD_POOL_MODEL::MODEL_CACHED)
+                    {
+                        if(std::cv_status::timeout == this->task_queue_no_empty.wait_for(lock,std::chrono::seconds(1)))
+                        {
+                            auto now_time = std::chrono::high_resolution_clock().now();
+                            auto idle_time = std::chrono::duration_cast<std::chrono::seconds>(now_time - last_time);
+                            if(idle_time.count() >= THREAD_IDLE_TIME && current_thread_number > init_thread_number)
+                            {
+                                thread_map.erase(thread_id);
+                                idle_thread_number--;
+                                current_thread_number--;
+                                return;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        this->task_queue_no_empty.wait(lock);
+                    }
+                }
+
+                task = this->task_queue.front();
+                this->task_queue.pop();
+                this->task_number--;
+                this->idle_thread_number--;
+                
+                this->task_queue_no_full.notify_all();
+            }
+     
+            if(task != nullptr)
+            {
+                task();
+            }
+            last_time = std::chrono::high_resolution_clock().now();
+            this->idle_thread_number++;
+        }
+
+    }
+};
+
+#endif

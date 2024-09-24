@@ -1,0 +1,27 @@
+#include "ThreadPool.hpp"
+
+int sum1(int a,int b)
+{
+    return a + b;
+}
+int sum2(int a, int b, int c)
+{
+    return a + b + c;
+}
+int main()
+{
+    ThreadPool threadpool;
+    threadpool.InitThreadPool();
+    threadpool.StartThreadPool();
+    std::future<int> result = threadpool.SubmitTask([](int begin, int end)
+    {
+        int sum = 0;
+        for(int i = begin; i <= end; i++)
+        {
+            sum += i;
+        }
+        return sum;
+    }, 0, 100);
+
+    std::cout << result.get() << std::endl;
+}
